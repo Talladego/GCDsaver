@@ -1,4 +1,4 @@
-local VERSION = 1.08
+local VERSION = 1.10
 local TIME_DELAY = 0.1
 local timeLeft = TIME_DELAY
 local MAX_STACK = 3
@@ -7,6 +7,12 @@ local UNSTOPPABLE = 5
 local MAX_BUTTONS = 60
 local eventsRegistered = false
 local loadingEnd = false
+
+-- Forward-declared so OnShutdown can restore hooks installed later in this file.
+local orgActionButtonOnLButtonUp
+local orgActionButtonOnLButtonDown
+local hookedActionButtonOnLButtonUp
+local hookedActionButtonOnLButtonDown
 
 -- Localized functions
 local pairs = pairs
@@ -172,12 +178,6 @@ local function isAbilityBlocked(actionId)
 
 end
 
-local orgWindowGameAction = WindowGameAction
--- No-op stand-in for WindowGameAction used while we want to prevent the
--- engine from executing the underlying game action for a click.
-local function blockedWindowGameAction(windowName)
-end
-
 -- GCDsaver
 GCDsaver = GCDsaver or {}
 GCDsaver.FriendlyTargetId = 0
@@ -304,6 +304,17 @@ end
 
 function GCDsaver.OnShutdown()
 	GCDsaver.UnregisterEvents()
+	-- Restore engine/UI hooks so other addons are not left with our wrappers.
+	if orgActionButtonOnLButtonUp and ActionButton
+		and ActionButton.OnLButtonUp == hookedActionButtonOnLButtonUp
+	then
+		ActionButton.OnLButtonUp = orgActionButtonOnLButtonUp
+	end
+	if orgActionButtonOnLButtonDown and ActionButton
+		and ActionButton.OnLButtonDown == hookedActionButtonOnLButtonDown
+	then
+		ActionButton.OnLButtonDown = orgActionButtonOnLButtonDown
+	end
 end
 
 function GCDsaver.RegisterEvents()
@@ -560,12 +571,55 @@ function GCDsaver.UpdateButtonEnabledState(slot)
 end
 
 -- Hooked Functions
+--
+-- Blocking lives in ActionButton.OnLButtonUp (mouse and keybinds both fire
+-- through it). The client drops /assist from a hotbar macro if addon code calls
+-- any Lua function while the click is handled, so non-ability buttons leave the
+-- hook through a tail call before anything else runs.
 
--- Wraps the default click handler to support shift-click configuration
--- and to optionally block actions by no-oping WindowGameAction
-local orgActionButtonOnLButtonDown = ActionButton.OnLButtonDown
+orgActionButtonOnLButtonUp = ActionButton.OnLButtonUp
+orgActionButtonOnLButtonDown = ActionButton.OnLButtonDown
 
-function ActionButton.OnLButtonDown(self, flags, x, y)
+local function isRealAbilityAction(actionType, actionId)
+	if not actionId or actionId == 0 then
+		return false
+	end
+	local pa = GameData and GameData.PlayerActions
+	if pa then
+		-- Macros, assist, targeting, items, crafting, etc. must pass through.
+		if actionType ~= nil and actionType ~= pa.DO_ABILITY then
+			return false
+		end
+	end
+	local abilityData = getAbilityDataCached(actionId)
+	return abilityData ~= nil and abilityData.id == actionId
+end
+
+hookedActionButtonOnLButtonUp = function(self, flags, x, y)
+	-- Non-abilities must reach the tail call without any Lua function call:
+	-- the client drops /assist (macros) if addon code calls a Lua function
+	-- while the click is handled. Field reads and the tail call are fine.
+	if not self or self.m_ActionType ~= GameData.PlayerActions.DO_ABILITY then
+		return orgActionButtonOnLButtonUp(self, flags, x, y)
+	end
+	local actionType, actionId = self.m_ActionType, self.m_ActionId
+	if isRealAbilityAction(actionType, actionId) then
+		-- Shift-click only configures (see OnLButtonDown); never fire.
+		if flags == SystemData.ButtonFlags.SHIFT then
+			return
+		end
+		if GCDsaver.Settings
+			and GCDsaver.Settings.Abilities[actionId]
+			and isAbilityBlocked(actionId)
+		then
+			return
+		end
+	end
+	return orgActionButtonOnLButtonUp(self, flags, x, y)
+end
+ActionButton.OnLButtonUp = hookedActionButtonOnLButtonUp
+
+hookedActionButtonOnLButtonDown = function(self, flags, x, y)
 	-- Shift-click: configure GCDsaver behavior but do not fire the ability
 	if flags == SystemData.ButtonFlags.SHIFT and self.m_ActionId ~= 0 then
 		if not GCDsaver.Settings.Abilities[self.m_ActionId] then
@@ -579,27 +633,21 @@ function ActionButton.OnLButtonDown(self, flags, x, y)
 		GCDsaver.UpdateButtonIcon(self.m_HotBarSlot, GCDsaver.Settings.Abilities[self.m_ActionId] or 0)
 		GCDsaver.UpdateButtonEnabledState(self.m_HotBarSlot)
 		chatInfo(self.m_ActionId, GCDsaver.Settings.Abilities[self.m_ActionId])
-		-- Ensure all hotbar copies of this ability reflect the new config
 		RefreshAllSlotsForAbility(self.m_ActionId)
-		-- Ensure this click only configures and never fires
-		WindowGameAction = blockedWindowGameAction
 		return
 	end
 
-	-- Block firing when GCDsaver says the ability should be blocked.
+	-- Block mouse-down for configured abilities that should not fire.
 	if self.m_ActionId ~= 0
 		and GCDsaver.Settings.Abilities[self.m_ActionId]
-		and isAbilityBlocked(self.m_ActionId) then
-		WindowGameAction = blockedWindowGameAction
-	else
-		WindowGameAction = orgWindowGameAction
+		and isAbilityBlocked(self.m_ActionId)
+	then
+		return
 	end
 
-	-- Call original OnLButtonDown last so other logic still runs
-	if orgActionButtonOnLButtonDown then
-		orgActionButtonOnLButtonDown(self, flags, x, y)
-	end
+	return orgActionButtonOnLButtonDown(self, flags, x, y)
 end
+ActionButton.OnLButtonDown = hookedActionButtonOnLButtonDown
 
 -- Extends the default enabled/disabled logic to gray out
 -- configured abilities when the target is immune or already affected
